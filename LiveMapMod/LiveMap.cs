@@ -1,15 +1,14 @@
 ﻿using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using ModAPI.Attributes;
 using TheForest.Items;
 using TheForest.Items.World;
 using TheForest.Utils;
 using UnityEngine;
-using UnityEngine.Networking;
 
 namespace LiveMap
 {
@@ -30,13 +29,26 @@ namespace LiveMap
 
         const int ACTION_TYPE_CLEAR = 0;
 
-        const float FRAME_RATE = 1f; // 5 per second (limited by coroutine SendUDP, I think)
+        const float UPDATE_INTERVAL_SECONDS = 1f;
 
         private float lastUpdate = 0.0f;
 
+        private TcpClient client;
+
+        private Queue<System.Object> queue = new Queue<System.Object>();
+        private readonly object queueLock = new object();
+        private bool isThreadStarted = false;
+
         void Awake()
         {
-            ModAPI.Log.Write("live map started: 15:39");
+            ModAPI.Log.Write("live map started: 11:35");
+            if (!isThreadStarted)
+            {
+                var th = new Thread(TcpClientLoop);
+                th.Start();
+                isThreadStarted = true;
+                ModAPI.Log.Write("Started TCP client thread");
+            }
         }
 
         void Update()
@@ -47,30 +59,27 @@ namespace LiveMap
             }
 
             lastUpdate += Time.deltaTime;
-            if (lastUpdate > FRAME_RATE)
+            if (lastUpdate > UPDATE_INTERVAL_SECONDS)
             {
                 lastUpdate = 0.0f;
 
-                List<MapEntry> entries = new List<MapEntry>();
                 try
                 {
                     if (LocalPlayer.Transform != null && LocalPlayer.Transform.position != null) 
                     {
-                        entries.Add(new MapEntry(TYPE_PLAYER, LocalPlayer.GameObject.GetInstanceID(), -1, "player", LocalPlayer.Transform.position, LocalPlayer.Transform.rotation.eulerAngles, LocalPlayer.IsInCaves));
+                        AddObjectToQueue(new MapEntry(TYPE_PLAYER, LocalPlayer.GameObject.GetInstanceID(), -1, "player", LocalPlayer.Transform.position, LocalPlayer.Transform.rotation.eulerAngles, LocalPlayer.IsInCaves));
                     }
 
-                    FindCanibals(entries);
+                    FindCannibals();
                 }
                 catch (Exception e)
                 {
                     ModAPI.Log.Write("Error: " + e);
                 }
-
-                StartCoroutine(SendUDP(entries, false));
             }
         }
 
-        private void FindCanibals(List<MapEntry> entries)
+        private void FindCannibals()
         {
             if (Scene.MutantControler == null || Scene.MutantControler.ActiveWorldCannibals == null)
             {
@@ -83,7 +92,7 @@ namespace LiveMap
             {
                 foreach (var c in Scene.MutantControler.ActiveCaveCannibals)
                 {
-                    entries.Add(new MapEntry(TYPE_ENEMY, c));
+                    AddObjectToQueue(new MapEntry(TYPE_ENEMY, c));
                     cannibalIDs.Add(c.GetInstanceID());
                 }
             }
@@ -91,7 +100,7 @@ namespace LiveMap
             {
                 foreach (var c in Scene.MutantControler.ActiveWorldCannibals)
                 {
-                    entries.Add(new MapEntry(TYPE_ENEMY, c));
+                    AddObjectToQueue(new MapEntry(TYPE_ENEMY, c));
                     cannibalIDs.Add(c.GetInstanceID());
                 }
             }
@@ -100,10 +109,20 @@ namespace LiveMap
             {
                 if (!cannibalIDs.Contains(c.GetInstanceID()))
                 {
-                    entries.Add(new MapEntry(TYPE_ENEMY, c));
+                    AddObjectToQueue(new MapEntry(TYPE_ENEMY, c));
                     cannibalIDs.Add(c.GetInstanceID());
                 }
             }
+        }
+
+        private void FindStaticObjects()
+        {
+            List<MapEntry> entries = new List<MapEntry>();
+            FindItems(entries, "PickUp", TYPE_PICKUP);
+            //FindSpawnPools();
+            FindCaveEntrances(entries);
+            // ModAPI.Log.Write("Sending static entries: " + entries.Count);
+            SendStaticObjects(entries);
         }
 
         private void FindCaveEntrances(List<MapEntry> entries)
@@ -132,21 +151,24 @@ namespace LiveMap
                     entries.Add(new MapEntry(TYPE_CAVE_ENTRANCE, go));
                     continue;
                 }
-                // ModAPI.Log.Write("Cave entrance: " + go.transform.position);
             }
-        }
-
-        private void FindStaticObjects()
-        {
-            List<MapEntry> entries = new List<MapEntry>();
-            FindItems(entries, "PickUp", TYPE_PICKUP);
-            FindCaveEntrances(entries);
-            StartCoroutine(SendUDP(entries, true));
         }
 
         private void FindItems(List<MapEntry> entries, string itemName, int entryType)
         {
-            GameObject[] objectsOfType = UnityEngine.Object.FindObjectsOfType<GameObject>();
+            GameObject[] objectsOfType;
+
+            objectsOfType = UnityEngine.Object.FindObjectsOfType<GameObject>();
+            ModAPI.Log.Write("Object.FindObjectsOfType: " + objectsOfType.Length);
+            HandleItems(entries, entryType, objectsOfType);
+
+            objectsOfType = Resources.FindObjectsOfTypeAll(typeof(GameObject)) as GameObject[];
+            ModAPI.Log.Write("Resources.FindObjectsOfTypeAll: " + objectsOfType.Length);
+            HandleItems(entries, entryType, objectsOfType);
+        }
+
+        private void HandleItems(List<MapEntry> entries, int entryType, GameObject[] objectsOfType)
+        {
             if (objectsOfType.NullOrEmpty())
                 return;
 
@@ -157,7 +179,7 @@ namespace LiveMap
             {
                 // if (!((UnityEngine.Object)gameObject == (UnityEngine.Object)null) && !gameObject.name.NullOrEmpty() && gameObject.name.Equals(name, comparisonType))
                 // if (!((UnityEngine.Object)gameObject == (UnityEngine.Object)null) && !gameObject.name.NullOrEmpty() && culture.CompareInfo.IndexOf(gameObject.name, itemName, CompareOptions.IgnoreCase) >= 0)
-                if (IsItemPickUp(gameObject))
+                if (ContainsComponent(gameObject, typeof(PickUp)))
                 {
                     // ModAPI.Log.Write("Found: " + gameObject.name + ", " + gameObject.GetInstanceID() + ", " + gameObject.transform.position);
                     entries.Add(new MapEntry(entryType, gameObject));
@@ -165,19 +187,39 @@ namespace LiveMap
                 }
             }
 
-            int itemId = 54; // rope
-            Item item = ItemDatabase.ItemById(itemId);
-            if (item != null)
+            //int itemId = 54; // rope
+            //Item item = ItemDatabase.ItemById(itemId);
+            //if (item != null)
+            //{
+            //    ModAPI.Log.Write("Found item: " + item._name);
+            //    GameObject itemGO = item._pickupPrefab.gameObject;
+            //    // DumpGameObject(itemGO);
+            //}
+        }
+
+        private void FindSpawnPools()
+        {
+            MonoBehaviour[] objectsOfType = Resources.FindObjectsOfTypeAll(typeof(MonoBehaviour)) as MonoBehaviour[];
+            if (objectsOfType.NullOrEmpty())
+                return;
+
+            CultureInfo culture = CultureInfo.InvariantCulture;
+            string itemName = "rope";
+
+            foreach (MonoBehaviour obj in objectsOfType)
             {
-                ModAPI.Log.Write("Found item: " + item._name);
-                GameObject itemGO = item._pickupPrefab.gameObject;
-                // DumpGameObject(itemGO);
+                if (!((UnityEngine.Object)obj == (UnityEngine.Object)null) && !obj.name.NullOrEmpty() && culture.CompareInfo.IndexOf(gameObject.name, itemName, CompareOptions.IgnoreCase) >= 0)
+                {
+                    ModAPI.Log.Write("Found SpawnItemFromPool: " + obj.name + ", " + obj.GetInstanceID() + ", " + obj.transform.position + ", " + obj);
+                    // entries.Add(new MapEntry(entryType, gameObject));
+                    DumpGameObject(obj.transform.gameObject);
+                }
             }
         }
 
-        private bool IsItemPickUp(GameObject go)
+        private bool ContainsComponent(GameObject go, Type type)
         {
-            if ((UnityEngine.Object) go == (UnityEngine.Object) null)
+            if ((UnityEngine.Object)go == (UnityEngine.Object)null)
             {
                 return false;
             }
@@ -186,12 +228,17 @@ namespace LiveMap
                 return false;
             }
 
-            PickUp pickUp = go.GetComponentInChildren(typeof(PickUp)) as PickUp;
-            return pickUp != null;
+            Component component = go.GetComponentInChildren(type);
+            return component != null;
         }
 
         private void DumpGameObject(GameObject go)
         {
+            if (go == null)
+            {
+                return;
+            }
+
             ModAPI.Log.Write("Game object: " + go.GetInstanceID() + ", " + go.name + " [" + go.tag + "]:" + go.ToString());
             foreach (Component c in go.GetComponentsInChildren<Component>())
             {
@@ -204,32 +251,104 @@ namespace LiveMap
             }
         }
 
-        IEnumerator SendUDP(List<MapEntry> entries, bool clearStaticObjects)
+        private void SendStaticObjects(List<MapEntry> entries)
         {
-            if (entries.Count == 0)
+            try
             {
-                yield return null;
-            }
+                ModAPI.Log.Write("SendStaticObjects: " + entries.Count);
 
-            using (UdpClient udp = new UdpClient())
-            {
-                if (clearStaticObjects)
-                {
-                    SendUDP(udp, new Action(ACTION_TYPE_CLEAR));
-                }
+                int nrPickup = 0;
+                int nrCave = 0;
+
+                AddObjectToQueue(new Action(ACTION_TYPE_CLEAR));
 
                 foreach (MapEntry e in entries)
                 {
-                    SendUDP(udp, e);
+                    AddObjectToQueue(e);
+
+                    if (e.type == TYPE_PICKUP)
+                    {
+                        nrPickup++;
+                    }
+                    if (e.type == TYPE_CAVE_ENTRANCE)
+                    {
+                        nrCave++;
+                    }
                 }
-            }   
+                ModAPI.Log.Write("Sent: " + nrCave + " caves, " + nrPickup + " pickups");
+            }
+            catch (Exception e)
+            {
+                ModAPI.Log.Write("Error: " + e);
+            }
         }
 
-        private void SendUDP(UdpClient udp, System.Object obj)
+        private void AddObjectToQueue(System.Object obj)
+        {
+            lock (queueLock)
+            {
+                queue.Enqueue(obj);
+            }
+        }
+
+        private void TcpClientLoop()
+        {
+            try
+            {
+                while (true)
+                {
+                    System.Object obj = null;
+                    lock (queueLock)
+                    {
+                        if (queue.Count > 0)
+                        {
+                            obj = queue.Dequeue();
+                        }
+                    }
+
+                    if (obj == null)
+                    {
+                        Thread.Sleep(50);
+                        continue;
+                    }
+
+                    SendAsJson(obj);
+                }
+            }
+            catch (Exception e)
+            {
+                ModAPI.Log.Write("Error: " + e);
+            }
+        }
+
+        private void SendAsJson(System.Object obj)
         {
             string json = JsonUtility.ToJson(obj);
+            json += "\n"; // separate objects with new line
             Byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
-            udp.Send(jsonBytes, jsonBytes.Length, "127.0.0.1", 9999);
+            TcpClient client = GetTcpClient();
+            NetworkStream stream = client.GetStream();
+            // using (NetworkStream stream = client.GetStream())
+            // {
+            stream.Write(jsonBytes, 0, jsonBytes.Length);
+            // }
+            // ModAPI.Log.Write("Sent: " + json);
+        }
+
+        private TcpClient GetTcpClient()
+        {
+            if (client != null && client.Connected)
+            {
+                return client;
+            }
+            if (client != null)
+            {
+                client.Close();
+            }
+
+            client = new TcpClient("127.0.0.1", 9999);
+            ModAPI.Log.Write("Connected to 127.0.0.1:9999");
+            return client;
         }
 
     }

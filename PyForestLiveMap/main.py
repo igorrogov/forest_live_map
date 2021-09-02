@@ -1,16 +1,15 @@
-import sys
 import json
-import time
+import sys
 from enum import Enum
 from pprint import pprint
 
 import pygame
 from pygame.locals import *
 from pygame.math import Vector2
-from twisted.internet.protocol import DatagramProtocol
 
 from twisted.internet.task import LoopingCall
-from twisted.internet import reactor
+from twisted.internet import reactor, protocol
+from twisted.protocols.basic import LineReceiver
 
 pygame.init()
 
@@ -79,8 +78,20 @@ def load_icons():
     ICONS[Item.DYNAMITE] = pygame.image.load("icons/dynamite_64.png")
 
 
-class Game(DatagramProtocol):
-    isLeaf = True
+class GameProtocol(LineReceiver):
+
+    delimiter = b"\n"
+
+    def connectionMade(self):
+        print("New incoming connection")
+
+    def lineReceived(self, line):
+        # print(line)
+        game_object = json.loads(line)
+        game.received_object(game_object)
+
+
+class Game:
 
     def __init__(self):
         super().__init__()
@@ -115,7 +126,11 @@ class Game(DatagramProtocol):
         # flag that tells whether the player is in the caves
         self.is_in_caves = False
         self.is_running = True
-        self.loop()
+        self.n_pickups = 0
+        self.n_cave_entrances = 0
+
+        self.looping_call = LoopingCall(self.loop)
+        self.looping_call.start(1.0 / FPS)
 
     # main loop method
     def loop(self):
@@ -128,7 +143,7 @@ class Game(DatagramProtocol):
         for event in pygame.event.get():
             if event.type == QUIT:
                 self.is_running = False
-                tick.stop()
+                self.looping_call.stop()
                 reactor.stop()
                 pygame.quit()
                 sys.exit()
@@ -151,11 +166,9 @@ class Game(DatagramProtocol):
             if go['type'] == TYPE_ENEMY:
                 del self.game_objects[gid]
 
-    def datagramReceived(self, data, addr):
-        game_object = json.loads(data.decode('utf-8'))
-
+    def received_object(self, game_object):
         if "actionType" in game_object:
-            self.remove_static_objects()
+            # self.remove_static_objects()
             return
 
         if game_object['type'] == TYPE_PLAYER and self.is_in_caves != game_object['inCave']:
@@ -164,7 +177,7 @@ class Game(DatagramProtocol):
 
         gid = game_object["id"]
         self.game_objects[gid] = game_object
-        self.game_object_last_update_time[gid] = time.time()
+        # self.game_object_last_update_time[gid] = time.time()
 
         # follow the player on the map
         if game_object['type'] == TYPE_PLAYER:
@@ -174,6 +187,11 @@ class Game(DatagramProtocol):
         if game_object['type'] == TYPE_PICKUP:
             game_object['item'] = Item.parse(game_object['itemID'])
             # pprint(game_object)
+            self.n_pickups += 1
+            print('Pickups: ' + str(self.n_pickups))
+        if game_object['type'] == TYPE_CAVE_ENTRANCE:
+            self.n_cave_entrances += 1
+            print('Cave entrances: ' + str(self.n_cave_entrances))
 
     def draw(self):
         if self.is_in_caves:
@@ -237,7 +255,7 @@ class Game(DatagramProtocol):
 
 game = Game()
 
-tick = LoopingCall(game.loop)
-tick.start(1.0 / FPS)
-reactor.listenUDP(9999, game)
+factory = protocol.Factory()
+factory.protocol = GameProtocol
+reactor.listenTCP(9999, factory)
 reactor.run()
